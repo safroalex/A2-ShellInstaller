@@ -1,0 +1,525 @@
+#!/bin/bash
+SCRIPT=$(realpath "$0")
+SCRIPTPATH=$(dirname "$SCRIPT")
+
+# Проверка прав администратора
+if [ "$EUID" -eq 0 ]; then
+    echo "Пожалуйста, не запускайте скрипт с правами администратора (sudo)." | tee >(logger)
+    exit 1
+fi
+
+# Для просмотра логов в рельном времени
+echo -e "\033[35mДля просмотра логов в рельном времени откройте еще один терминал и выполните >sudo tail -f /var/log/syslog<\033[0m"
+
+# Обработка прерываний
+trap "echo 'Скрипт был прерван. Проверьте логи для получения дополнительной информации.' | tee >(logger); exit 1" INT
+
+# Функция обработки ошибок установки
+handle_install_errors() {
+    case $1 in
+        0) echo "Установка $2 успешно завершена!" | tee >(logger) ;;
+        1) echo "Общая ошибка выполнения." | tee >(logger) ;;
+        100) echo "Во время установки $2 произошла ошибка." | tee >(logger) ;;
+        101) echo "Пакет $2 не найден." | tee >(logger) ;;
+        102) echo "Проблемы с зависимостями пакета $2." | tee >(logger) ;;
+        103) echo "Недостаточно места на диске для установки $2." | tee >(logger) ;;
+        104) echo "Ошибка в исходном списке пакетов (sources.list)." | tee >(logger) ;;
+        105) echo "Установка $2 была прервана пользователем." | tee >(logger) ;;
+        106) echo "Ошибка при скачивании пакета $2." | tee >(logger) ;;
+        *) echo "Неизвестная ошибка. Проверьте логи для получения дополнительной информации." | tee >(logger) ;;
+    esac
+}
+
+# Функция для проверки и установки пакета
+install_package() {
+    sudo apt-get update | logger
+
+    package_name=$1
+    additional_packages=$2
+
+    # Проверка доступности пакета
+    if ! apt-cache show $package_name > >(logger) 2>&1; then
+        echo "Пакет $package_name не найден. Проверьте ваш список источников пакетов или попробуйте обновить пакеты с помощью 'sudo apt update'." | tee >(logger)
+        exit 1
+    fi
+
+    # Проверка, установлен ли уже пакет
+    if dpkg -l | grep $package_name > >(logger) 2>&1; then
+        read -p "Пакет $package_name уже установлен. Вы все равно хотите продолжить установку? (y/n) " -n 1 -r
+        echo    # (optional) move to a new line
+        if [[ ! $REPLY =~ ^[Yy]$ ]]
+        then
+            exit 1
+        fi
+    fi
+
+    echo "Начинаем установку $package_name $additional_packages..." | tee >(logger)
+    sudo apt install -y $package_name $additional_packages 2>&1 | logger
+
+    # Обработка кодов возврата
+    handle_install_errors $? "$package_name $additional_packages"
+
+    # Проверка успешности установки
+    if ! dpkg -l | grep $package_name > >(logger) 2>&1; then
+        echo "Пакет $package_name не был установлен. Проверьте логи для получения дополнительной информации." | tee >(logger)
+        exit 1
+    fi
+}
+
+# Функция полной установки и конфигурации
+install_all() {
+    echo "Вы выбрали полную установку. Перед ней будут автоматически ообновлены пакеты." | tee >(logger)
+
+    # Проверка, установлен ли уже websocket
+    if which postgres-websockets > >(logger) 2>&1; then
+        read -p "Пакет websocket уже установлен. Вы все равно хотите продолжить установку? (y/n) " -n 1 -r
+        echo    # (optional) move to a new line
+        if [[ ! $REPLY =~ ^[Yy]$ ]]
+        then
+            exit 1
+        fi
+    fi
+
+    # Обновление списка пакетов
+    sudo apt-get update | logger
+
+    # Установка Node.js глобально
+    install_package "nodejs"
+
+    # Установка npm глобально
+    install_package "npm"
+
+    # Установка n глобально
+    sudo npm install -g n 2>&1 | logger
+
+    # Обработка кодов возврата
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при установке n. Проверьте логи для получения дополнительной информации." | tee >(logger)
+        exit 1
+    else
+        echo "Установка n успешно завершена! Начинаю обновление nodejs и установку Node-Red" | tee >(logger)
+    fi
+
+    # Обновление до последней стабильной версии Node.js
+    sudo n stable > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при обновлении Node.js до последней стабильной версии." | tee >(logger)
+        exit 1
+    fi
+
+    # Создание нового пользователя
+    if id -u nodered >/dev/null 2>&1; then
+        echo "Пользователь nodered уже существует." | tee >(logger)
+    else
+        sudo useradd -m nodered
+        if [ $? -ne 0 ]; then
+            echo "Ошибка при создании пользователя nodered." | tee >(logger)
+            exit 1
+        fi
+    fi
+
+    # Установка пароля для нового пользователя
+    echo "nodered:debian" | sudo chpasswd > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при установке пароля для пользователя nodered." | tee >(logger)
+        exit 1
+    fi
+
+    # Добавление пользователя nodered в файл sudoers
+    if [ -f /etc/sudoers.d/nodered ]; then
+        echo "Пользователь nodered уже добавлен в файл sudoers." | tee >(logger)
+    else
+        echo "nodered ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/nodered > >(logger) 2>&1
+        if [ $? -ne 0 ]; then
+            echo "Ошибка при добавлении пользователя nodered в файл sudoers." | tee >(logger)
+            exit 1
+        fi
+    fi
+
+    # Установка Node-RED под пользователем nodered
+    sudo -u nodered bash -c 'cd ~ && npm install --unsafe-perm node-red' > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при установке Node-RED под пользователем nodered." | tee >(logger)
+        exit 1
+    else
+        echo "Node-RED успешно установлен." | tee >(logger)
+    fi
+    
+    # Установка Mosquitto глобально
+    install_package "mosquitto" "mosquitto-clients"
+
+    # Установка PostgreSQL глобально
+    install_package "postgresql" "postgresql-contrib"
+
+    # Запуск Node-RED в фоновом режиме под пользователем nodered на 10 секунд
+    sudo -u nodered bash -c 'timeout 10s /home/nodered/node_modules/.bin/node-red > /dev/null 2>&1 &'
+
+    echo "Ожидание 10 секунд, чтобы убедиться, что Node-RED создал директорию .node-red" | tee >(logger)
+
+    # Ожидание 10 секунд, чтобы убедиться, что Node-RED создал директорию .node-red
+    sleep 10
+
+    # Копирование файлов flows.json в директорию Node-RED
+    sudo cp -v $SCRIPTPATH/OEE-Node-red/flows.json /home/nodered/.node-red/ > >(logger) 2>&1
+
+    # Переход в директорию Node-RED
+    cd /home/nodered/.node-red
+
+    # Установка сторонних узлов с помощью npm
+    sudo npm install node-red-node-email > >(logger) 2>&1
+    sudo npm install node-red-contrib-postgresql > >(logger) 2>&1
+
+    # Установка нашего узла
+    sudo npm install $SCRIPTPATH/OEE-Node-red/regid-from-topic > >(logger) 2>&1
+
+    # Переход в /home/defaultUser
+    cd
+
+    # Добавление строк в начало файла settings.json
+    sudo sed -i '1s/^/process.env.HOSTNAME = require('"'"'os'"'"').hostname();\n/' /home/nodered/.node-red/settings.js
+    sudo sed -i '2s/^/process.env.startInfo = JSON.stringify({online:1, sv:0, ts:new Date()});\n/' /home/nodered/.node-red/settings.js
+
+    sudo -u postgres bash -c "psql" <<'EOF' > >(logger) 2>&1
+    DROP DATABASE IF EXISTS evomatics;
+EOF
+
+    # Создание базы данных
+    sudo -u postgres createdb evomatics > >(logger) 2>&1
+
+    # Установка пароля для пользователя
+    sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';" > >(logger) 2>&1
+
+    # Установка расширения pldbgapi для PostgreSQL
+    install_package "postgresql-13-pldebugger" 
+
+    # Вставка дампов
+    sudo -u postgres psql evomatics < $SCRIPTPATH/OEE-Node-red/oee_db.sql > >(logger) 2>&1
+    sudo -u postgres psql evomatics < $SCRIPTPATH/OEE-Node-red/oee.dt_reasons.sql > >(logger) 2>&1
+    sudo -u postgres psql evomatics < $SCRIPTPATH/OEE-Node-red/oee.machine_types.sql > >(logger) 2>&1
+    sudo -u postgres psql evomatics < $SCRIPTPATH/OEE-Node-red/oee.machine_type_dt_reasons.sql > >(logger) 2>&1
+
+    # Создание файла демона node-red.service
+    sudo bash -c 'cat > /lib/systemd/system/node-red.service' << EOF > >(logger) 2>&1
+    [Unit]
+    Description=Node-RED
+    After=syslog.target network.target
+    Documentation=http://nodered.org/
+    [Service]
+    Environment="NODE_PATH=/usr/lib/node_modules:/usr/lib/node_modules/node-red:$NODE_PATH"
+    Environment="NODE_OPTIONS=--max-old-space-size=128"
+    PassEnvironment=NODE_PATH
+    #Environment="NODE_RED_OPTIONS=-v"
+    #Full Path to Node.js
+    ExecStart=/home/nodered/node_modules/.bin/node-red
+    WorkingDirectory=/home/nodered
+    # User/Group that launches node-RED (it's advised to create a new user for Node-RED)
+    # You can do : sudo useradd node-red
+    # then change the User=root by User=node-red
+    User=nodered
+    Group=nodered
+    Nice=10
+    SyslogIdentifier=Node-RED
+    StandardOutput=syslog
+    # Node-RED need a SIGINT to be notified to stop
+    KillSignal=SIGINT
+    [Install]
+    WantedBy=multi-user.target
+EOF
+
+    # Обновление systemd, чтобы он знал о новом демоне
+    sudo systemctl daemon-reload > >(logger) 2>&1
+
+    # Включение демона node-red, чтобы он запускался при загрузке
+    sudo systemctl enable node-red > >(logger) 2>&1
+
+    #Запуск демона без перезагрузки
+    sudo systemctl start node-red > >(logger) 2>&1
+
+    #Вывод статуса демона node-red
+    sudo systemctl status node-red > >(logger) 2>&1
+
+    # Установка websocket в /tmp/postgres-websockets
+     wget -O /tmp/postgres-websockets "https://github.com/diogob/postgres-websockets/releases/download/0.11.1.0/postgres-websockets" > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при загрузке websocket." | tee >(logger)
+        exit 1
+    fi
+
+    # Проверка целостности файла
+    if ! echo "2409421eb8f83010924d0dc725e359b82f5814ba0bce3a81f6dad1586c18c542  /tmp/postgres-websockets" | sha256sum -c - > >(logger) 2>&1; then
+        echo "Ошибка проверки целостности файла websocket." | tee >(logger)
+        read -p "Контрольная сумма файла не совпадает, что может указывать на поврежденный или измененный файл. Вы все равно хотите продолжить установку? (y/n) " -n 1 -r
+        echo    # (optional) move to a new line
+        if [[ ! $REPLY =~ ^[Yy]$ ]]
+        then
+            exit 1
+        fi
+    fi
+
+    # Перенос websocket в /usr/bin/postgres-websockets
+    sudo mv /tmp/postgres-websockets /usr/bin/postgres-websockets > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при перемещении websocket в /usr/bin/postgres-websockets." | tee >(logger)
+        exit 1
+    fi
+
+    # Права на исполнение
+    sudo chmod +x /usr/bin/postgres-websockets > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при установке прав на исполнение для /usr/bin/postgres-websockets." | tee >(logger)
+        exit 1
+    else 
+        echo "Установка websocket и остальных программ прошла успешно. Установка завершена."
+    fi
+
+    # Добавление демона websocket
+    sudo bash -c 'cat > /lib/systemd/system/postgres-websockets.service' << EOF > >(logger) 2>&1
+    [Unit]
+    Description=Postgres notify to websockets
+    After=syslog.target network.target
+    Documentation=http://nodered.org/
+    [Service]
+    Environment="PGWS_DB_URI=postgres://postgres:postgres@localhost:5432/evomatics"
+    Environment="PGWS_POOL_SIZE=10"
+    Environment="PGWS_ROOT_PATH=./client-root"
+    Environment="PGWS_LISTEN_CHANNEL=postgres-websockets-listener"
+    Environment="PGWS_META_CHANNEL=server-info"
+    Environment="PGWS_HOST=127.0.0.1"
+    Environment="PGWS_PORT=3000"
+    Environment="PGWS_JWT_SECRET=sj8ijdqsHNbTdYck9cOLArXA22GSIN0ZhpB68jXH"
+    Environment="PGWS_JWT_SECRET_BASE64=False"
+    Environment="PGWS_CHECK_LISTENER_INTERVAL=10000"
+    PassEnvironment=PGWS_DB_URI PGWS_POOL_SIZE PGWS_ROOT_PATH PGWS_LISTEN_CHANNEL PGWS_META_CHANNEL PGWS_HOST PGWS_PORT PGWS_JWT_SECRET PGWS_JWT_SECRET_BASE64 PGWS_CHECK_LISTENER_INTERVAL
+    ExecStart=/usr/bin/postgres-websockets
+    WorkingDirectory=/home/nodered
+    User=nodered
+    Group=nodered
+    Nice=10
+    SyslogIdentifier=postgres-websockets
+    StandardOutput=syslog
+    [Install]
+    WantedBy=multi-user.target
+EOF
+
+# Обновление systemd, чтобы он знал о новом демоне
+sudo systemctl daemon-reload > >(logger) 2>&1
+
+# Включение демона postgres-websockets, чтобы он запускался при загрузке
+sudo systemctl enable postgres-websockets > >(logger) 2>&1
+
+# Запуск демона без перезагрузки
+sudo systemctl start postgres-websockets > >(logger) 2>&1
+
+# Вывод статуса демона postgres-websockets
+sudo systemctl status postgres-websockets > >(logger) 2>&1
+
+}
+
+#Установка nodered и websocket без конфигурации
+install_node_red_websocket() {
+
+    # Проверка, установлен ли уже websocket
+    if which postgres-websockets > >(logger) 2>&1; then
+        read -p "Пакет websocket уже установлен. Вы все равно хотите продолжить установку? (y/n) " -n 1 -r
+        echo    # (optional) move to a new line
+        if [[ ! $REPLY =~ ^[Yy]$ ]]
+        then
+            exit 1
+        fi
+    fi
+
+    echo "Начинаем установку nodejs, npm и n. Ожидайте 1-2 мин..." | tee >(logger)
+    install_package "nodejs"
+    install_package "npm"
+    
+    sudo npm install -g n 2>&1 | logger
+
+    # Обработка кодов возврата
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при установке n. Проверьте логи для получения дополнительной информации." | tee >(logger)
+        exit 1
+    else
+        echo "Установка n успешно завершена! Начинаю установку Node-Red" | tee >(logger)
+    fi
+
+
+    # Обновление до последней стабильной версии Node.js
+    sudo n stable > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при обновлении Node.js до последней стабильной версии." | tee >(logger)
+        exit 1
+    fi
+
+    # Создание нового пользователя
+    if id -u nodered >/dev/null 2>&1; then
+        echo "Пользователь nodered уже существует." | tee >(logger)
+    else
+        sudo useradd -m nodered
+        if [ $? -ne 0 ]; then
+            echo "Ошибка при создании пользователя nodered." | tee >(logger)
+            exit 1
+        fi
+    fi
+
+    # Установка пароля для нового пользователя
+    echo "nodered:debian" | sudo chpasswd > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при установке пароля для пользователя nodered." | tee >(logger)
+        exit 1
+    fi
+
+    # Добавление пользователя nodered в файл sudoers
+    if [ -f /etc/sudoers.d/nodered ]; then
+        echo "Пользователь nodered уже добавлен в файл sudoers." | tee >(logger)
+    else
+        echo "nodered ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/nodered > >(logger) 2>&1
+        if [ $? -ne 0 ]; then
+            echo "Ошибка при добавлении пользователя nodered в файл sudoers." | tee >(logger)
+            exit 1
+        fi
+    fi
+
+    # Установка Node-RED под пользователем nodered
+    sudo -u nodered bash -c 'cd ~ && npm install --unsafe-perm node-red' > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при установке Node-RED под пользователем nodered." | tee >(logger)
+        exit 1
+    else
+        echo "Node-RED успешно установлен. Начинаю установку websocket..." | tee >(logger)
+    fi
+
+    # Установка websocket в /tmp/postgres-websockets
+     wget -O /tmp/postgres-websockets "https://github.com/diogob/postgres-websockets/releases/download/0.11.1.0/postgres-websockets" > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при загрузке websocket." | tee >(logger)
+        exit 1
+    fi
+
+    # Проверка целостности файла
+    if ! echo "2409421eb8f83010924d0dc725e359b82f5814ba0bce3a81f6dad1586c18c542  /tmp/postgres-websockets" | sha256sum -c - > >(logger) 2>&1; then
+        echo "Ошибка проверки целостности файла websocket." | tee >(logger)
+        read -p "Контрольная сумма файла не совпадает, что может указывать на поврежденный или измененный файл. Вы все равно хотите продолжить установку? (y/n) " -n 1 -r
+        echo    # (optional) move to a new line
+        if [[ ! $REPLY =~ ^[Yy]$ ]]
+        then
+            exit 1
+        fi
+    fi
+
+    # Перенос websocket в /usr/bin/postgres-websockets
+    sudo mv /tmp/postgres-websockets /usr/bin/postgres-websockets > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при перемещении websocket в /usr/bin/postgres-websockets." | tee >(logger)
+        exit 1
+    fi
+
+    # Права на исполнение
+    sudo chmod +x /usr/bin/postgres-websockets > >(logger) 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ошибка при установке прав на исполнение для /usr/bin/postgres-websockets." | tee >(logger)
+        exit 1
+    else 
+        echo "Установка websocket и остальных программ прошла успешно. Установка завершена."
+    fi
+}
+
+install_mosquitto() {
+    install_package "mosquitto" "mosquitto-clients"
+}
+
+install_postgres() {
+    install_package "postgresql" "postgresql-contrib"
+}
+
+# Проверка на наличие флагов
+all_flag=false
+node_red_websocket_flag=false
+mosquitto_flag=false
+postgres_flag=false
+
+while getopts "anmp0" opt; do
+  case ${opt} in
+    a ) all_flag=true ;;
+    n ) node_red_websocket_flag=true ;;
+    m ) mosquitto_flag=true ;;
+    p ) postgres_flag=true ;;
+    * ) echo "Недопустимый флаг: -$OPTARG" >&2
+        echo "Usage: cmd [-a] [-n] [-m] [-p]"
+        exit 1 ;;
+  esac
+done
+
+# Проверка на наличие конфликтующих флагов
+if $all_flag && ( $node_red_websocket_flag || $mosquitto_flag || $postgres_flag ); then
+    echo "Флаг -a не может быть использован с другими флагами."
+    exit 1
+fi
+
+# Вызов функций установки в зависимости от переданных флагов
+if $all_flag; then
+    install_all
+fi
+if $node_red_websocket_flag; then
+    install_node_red_websocket
+fi
+if $mosquitto_flag; then
+    install_mosquitto
+fi
+if $postgres_flag; then
+    install_postgres
+fi
+
+# Если ни одного флага не было передано, запустить интерактивный режим
+if ! $all_flag && ! $node_red_websocket_flag && ! $mosquitto_flag && ! $postgres_flag; then
+    echo -e "\033[32mВы не передали ни одного флага. Запуск интерактивного режима...\033[0m"
+
+    # Вывод предупреждений о недопустимых комбинациях
+    echo -e "\033[33mФлаг 1 (All) не может быть использован с другими флагами.\033[0m"
+
+    echo -e "\033[33mФлаг 5 (Выход) не может быть использован с другими флагами.\033[0m"
+
+    # Здесь код для интерактивного режима
+    while true; do
+        read -p "Введите номера для выбора установки через пробел (1 - All, 2 - Node Red and Websocket, 3 - Mosquitto, 4 - Postgres, 5 - Выход): " input
+
+        # Преобразование ввода в массив
+        choices=($input)
+
+        # Проверка на недопустимые комбинации
+        if [[ " ${choices[@]} " =~ " 1 " ]] && [[ ${#choices[@]} -gt 1 ]]; then
+            echo -e "\033[33mФлаг 1 (All) не может быть использован с другими флагами.\033[0m"
+            continue
+        fi
+
+        # Проверка на наличие флага 5 с другими флагами
+        if [[ " ${choices[@]} " =~ " 5 " ]] && [[ ${#choices[@]} -gt 1 ]]; then
+            echo -e "\033[33mФлаг 5 (Выход) не может быть использован с другими флагами.\033[0m"
+            continue
+        fi
+
+        # Объявление ассоциативного массива для отслеживания обработанных выборов
+        declare -A processed_choices
+
+        # Обработка каждого выбора
+        for choice in "${choices[@]}"; do
+            # Если выбор уже был обработан, пропустить его
+            if [ ${processed_choices[$choice]} ]; then
+                echo "Выбор $choice уже был обработан. Пропускаем..."
+                continue
+            fi
+
+            case $choice in
+                1) install_all;;
+                2) install_node_red_websocket;;
+                3) install_mosquitto;;
+                4) install_postgres;;
+                5) echo "Выход из программы"; exit;;
+                *) echo "Неверный ввод: $choice. Пожалуйста, ввведите число(а) от 1 до 6 через пробел."; continue 2;;
+            esac
+
+            # Пометить выбор как обработанный
+            processed_choices[$choice]=1
+        done
+        break
+    done
+fi
