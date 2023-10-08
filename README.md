@@ -1,5 +1,8 @@
 # Shell-Based-Debian11-Stack-Config
 
+[![License: MIT](https://img.shields.io/badge/License-Apache-yellow.svg)]([https://github.com/safroalex/B1-PostgreSQLAutoServiceERP/blob/main/LICENSE](https://github.com/safroalex/A2-ShellInstaller/blob/main/LICENSE))
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/90fc0534428e4a87a720f69a2abc7cac)](https://app.codacy.com/gh/safroalex/A2-ShellInstaller/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
+
 This repository contains a Bash script for the automated installation and configuration of the following components on a Debian 11 operating system.
 
 ## Requirements
