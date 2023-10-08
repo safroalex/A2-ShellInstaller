@@ -23,3 +23,11 @@ Please note that this script is intended to work with a submodule, which will no
 ## Usage as a Template
 
 This script can be used as a template for your own Bash-based automated installation and configuration.
+
+## License
+
+Apache License. For more information, see the [LICENSE](LICENSE) file.
+
+---
+
+For any questions or suggestions, feel free to reach out at `github::safroalex`.
